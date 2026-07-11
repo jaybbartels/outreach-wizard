@@ -99,6 +99,19 @@ export const api = {
     return res.json()
   },
 
+  async bulkCreateMessages(campaignId: string, messages: any[]) {
+    const res = await fetch(`${API_URL}/api/v1/execute/messages`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ campaign_id: campaignId, messages })
+    })
+    if (!res.ok) {
+      const errorData = await res.json().catch(() => ({}))
+      throw new Error(errorData.error?.message || 'Failed to save messages')
+    }
+    return res.json()
+  },
+
   async getResponses(campaignId?: string) {
     const params = campaignId ? `?campaign_id=${campaignId}` : ''
     const res = await fetch(`${API_URL}/api/v1/execute/responses${params}`)

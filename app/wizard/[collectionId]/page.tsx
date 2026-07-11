@@ -3,6 +3,7 @@
 import { useEffect, useState } from 'react'
 import { useParams, useRouter } from 'next/navigation'
 import Link from 'next/link'
+import * as XLSX from 'xlsx'
 import { api } from '@/lib/api'
 
 interface Executive {
@@ -28,6 +29,27 @@ const STEPS: CampaignStep[] = [
   { step: 5, title: 'Execute', description: 'Schedule & send' }
 ]
 
+function mergeTemplate(template: string, exec: Executive) {
+  return template
+    .replace(/\{\{\s*name\s*\}\}/gi, exec.name || '')
+    .replace(/\{\{\s*company\s*\}\}/gi, exec.company_name || 'your company')
+    .replace(/\{\{\s*title\s*\}\}/gi, exec.title || '')
+}
+
+function splitSubjectBody(merged: string) {
+  const lines = merged.split('\n')
+  if (lines[0]?.toLowerCase().startsWith('subject:')) {
+    const subject = lines[0].replace(/subject:\s*/i, '').trim()
+    const body = lines.slice(1).join('\n').trim()
+    return { subject, body }
+  }
+  return { subject: '', body: merged.trim() }
+}
+
+function formatDateForFile(d: Date) {
+  return d.toISOString().slice(0, 19).replace('T', ' ')
+}
+
 export default function CampaignWizard() {
   const params = useParams()
   const router = useRouter()
@@ -42,6 +64,8 @@ export default function CampaignWizard() {
   const [isSubmitting, setIsSubmitting] = useState(false)
   const [generatingStrategy, setGeneratingStrategy] = useState(false)
   const [generatingMessage, setGeneratingMessage] = useState(false)
+  const [copiedId, setCopiedId] = useState<string | null>(null)
+  const [launchSuccess, setLaunchSuccess] = useState(false)
 
   // Form state
   const [campaignName, setCampaignName] = useState('')
@@ -50,6 +74,7 @@ export default function CampaignWizard() {
   const [strategy, setStrategy] = useState('')
   const [messageTemplate, setMessageTemplate] = useState('')
   const [scheduledDate, setScheduledDate] = useState('')
+  const [staggerMinutes, setStaggerMinutes] = useState(15)
 
   useEffect(() => {
     loadData()
@@ -78,10 +103,10 @@ export default function CampaignWizard() {
     )
   }
 
+  const getSelectedExecs = () => executives.filter((e) => selectedExecutives.includes(e.id))
+
   const getSelectedTitles = () => {
-    const titles = executives
-      .filter((e) => selectedExecutives.includes(e.id))
-      .map((e) => e.title)
+    const titles = getSelectedExecs().map((e) => e.title)
     return Array.from(new Set(titles)).join(', ') || 'Executives'
   }
 
@@ -164,11 +189,60 @@ export default function CampaignWizard() {
     return true
   }
 
+  // Build one row per recipient: merged subject/body + computed send time
+  const buildRecipientRows = () => {
+    const baseTime = scheduledDate ? new Date(scheduledDate) : new Date()
+    return getSelectedExecs().map((exec, idx) => {
+      const merged = mergeTemplate(messageTemplate, exec)
+      const { subject, body } = splitSubjectBody(merged)
+      const sendAt = new Date(baseTime.getTime() + idx * staggerMinutes * 60000)
+      return {
+        executive_id: exec.id,
+        executive_name: exec.name,
+        executive_email: exec.email || '',
+        company_name: exec.company_name || '',
+        title: exec.title || '',
+        subject,
+        message_content: body,
+        channel,
+        scheduled_at: sendAt.toISOString()
+      }
+    })
+  }
+
+  const downloadExcel = (rows: ReturnType<typeof buildRecipientRows>) => {
+    const sheetData = rows.map((r) => ({
+      Name: r.executive_name,
+      Company: r.company_name,
+      Title: r.title,
+      Email: r.executive_email,
+      Channel: r.channel,
+      Subject: r.subject,
+      Message: r.message_content,
+      'Send Date': new Date(r.scheduled_at).toLocaleDateString(),
+      'Send Time': new Date(r.scheduled_at).toLocaleTimeString()
+    }))
+
+    const worksheet = XLSX.utils.json_to_sheet(sheetData)
+    worksheet['!cols'] = [
+      { wch: 20 }, { wch: 20 }, { wch: 20 }, { wch: 28 },
+      { wch: 10 }, { wch: 35 }, { wch: 60 }, { wch: 12 }, { wch: 12 }
+    ]
+
+    const workbook = XLSX.utils.book_new()
+    const sheetName = (campaignName || 'Outreach').substring(0, 31)
+    XLSX.utils.book_append_sheet(workbook, worksheet, sheetName)
+
+    const fileName = `${(campaignName || 'outreach').replace(/[^a-z0-9]/gi, '_')}_send_list.xlsx`
+    XLSX.writeFile(workbook, fileName)
+  }
+
   const handleExecuteCampaign = async () => {
     setIsSubmitting(true)
     setError('')
 
     try {
+      // 1. Create the campaign record
       const campaignData = {
         user_id: 'demo-user-001',
         name: campaignName,
@@ -183,20 +257,43 @@ export default function CampaignWizard() {
         replied_count: 0
       }
 
-      const response = await api.createCampaign(campaignData)
-
-      if (response.success) {
-        alert('Campaign created successfully! 🎉')
-        router.push('/')
-      } else {
-        setError(response.error?.message || 'Failed to create campaign')
+      const campaignResponse = await api.createCampaign(campaignData)
+      if (!campaignResponse.success) {
+        setError(campaignResponse.error?.message || 'Failed to create campaign')
+        return
       }
+      const campaignId = campaignResponse.data.id
+
+      // 2. Build personalized rows (merged message + computed send time)
+      const rows = buildRecipientRows()
+
+      // 3. Save each prepared message to the database for the send tool to consume
+      const saveResponse = await api.bulkCreateMessages(campaignId, rows)
+      if (!saveResponse.success) {
+        setError(saveResponse.error?.message || 'Campaign created, but failed to save prepared messages')
+        return
+      }
+
+      // 4. Generate the downloadable Excel file
+      downloadExcel(rows)
+
+      setLaunchSuccess(true)
     } catch (error) {
-      console.error('Failed to create campaign:', error)
+      console.error('Failed to execute campaign:', error)
       const errorMsg = error instanceof Error ? error.message : 'Unknown error'
-      setError(`Failed to create campaign: ${errorMsg}`)
+      setError(`Failed to launch campaign: ${errorMsg}`)
     } finally {
       setIsSubmitting(false)
+    }
+  }
+
+  const copyToClipboard = async (text: string, id: string) => {
+    try {
+      await navigator.clipboard.writeText(text)
+      setCopiedId(id)
+      setTimeout(() => setCopiedId(null), 2000)
+    } catch (err) {
+      console.error('Copy failed:', err)
     }
   }
 
@@ -206,6 +303,27 @@ export default function CampaignWizard() {
         <div className="text-center">
           <div className="animate-spin text-5xl mb-4">⏳</div>
           <p className="text-lg text-gray-700">Loading campaign wizard...</p>
+        </div>
+      </div>
+    )
+  }
+
+  if (launchSuccess) {
+    return (
+      <div className="min-h-screen bg-gray-100 flex items-center justify-center px-6">
+        <div className="bg-white rounded-lg shadow-lg p-10 max-w-lg text-center">
+          <div className="text-6xl mb-4">🎉</div>
+          <h2 className="text-2xl font-bold text-gray-900 mb-3">Campaign Launched!</h2>
+          <p className="text-gray-700 mb-6">
+            {selectedExecutives.length} personalized message(s) were saved to the database and an Excel
+            send-list has been downloaded to your computer, ready for your send tool.
+          </p>
+          <Link
+            href="/"
+            className="inline-block bg-blue-600 hover:bg-blue-700 text-white px-6 py-3 rounded-lg font-bold"
+          >
+            ← Back to Dashboard
+          </Link>
         </div>
       </div>
     )
@@ -356,6 +474,9 @@ export default function CampaignWizard() {
                       className="w-full px-4 py-2 border-2 border-gray-300 rounded-lg focus:outline-none focus:ring-2 focus:ring-blue-500 text-gray-900"
                       rows={8}
                     />
+                    <p className="text-gray-500 text-xs mt-2">
+                      Note: this is advisory guidance only. Actual per-recipient send timing is set in Step 5.
+                    </p>
                   </div>
                 </div>
               )}
@@ -377,11 +498,11 @@ export default function CampaignWizard() {
                     <textarea
                       value={messageTemplate}
                       onChange={(e) => setMessageTemplate(e.target.value)}
-                      placeholder="Create your message, or click 'Generate with AI' above."
-                      className="w-full px-4 py-2 border-2 border-gray-300 rounded-lg focus:outline-none focus:ring-2 focus:ring-blue-500 text-gray-900"
+                      placeholder="Create your message, or click 'Generate with AI' above. Use {{name}}, {{company}}, {{title}} placeholders."
+                      className="w-full px-4 py-2 border-2 border-gray-300 rounded-lg focus:outline-none focus:ring-2 focus:ring-blue-500 text-gray-900 font-mono text-sm"
                       rows={10}
                     />
-                    <p className="text-gray-600 text-sm mt-2">💡 Tip: Use name, company, and title placeholders for personalization</p>
+                    <p className="text-gray-600 text-sm mt-2">💡 Use placeholders: name, company, title — merged per-recipient in Step 5</p>
                   </div>
                 </div>
               )}
@@ -389,7 +510,7 @@ export default function CampaignWizard() {
               {currentStep === 5 && (
                 <div>
                   <h2 className="text-2xl font-bold text-gray-900 mb-6">Step 5: Review & Execute</h2>
-                  <div className="bg-blue-50 border-2 border-blue-200 rounded-lg p-6 space-y-4 mb-6">
+                  <div className="bg-blue-50 border-2 border-blue-200 rounded-lg p-6 space-y-4 mb-8">
                     <div>
                       <p className="text-gray-700 font-bold">Campaign Name:</p>
                       <p className="text-gray-900">{campaignName}</p>
@@ -402,34 +523,120 @@ export default function CampaignWizard() {
                       <p className="text-gray-700 font-bold">Channel:</p>
                       <p className="text-gray-900 capitalize">{channel}</p>
                     </div>
-                    {strategy && (
-                      <div>
-                        <p className="text-gray-700 font-bold">Strategy:</p>
-                        <p className="text-gray-900 whitespace-pre-wrap text-sm">{strategy}</p>
-                      </div>
-                    )}
-                    {messageTemplate && (
-                      <div>
-                        <p className="text-gray-700 font-bold">Message Preview:</p>
-                        <p className="text-gray-900 whitespace-pre-wrap text-sm bg-white p-3 rounded border">{messageTemplate}</p>
-                      </div>
-                    )}
                     <div>
                       <p className="text-gray-700 font-bold">Status:</p>
                       <p className="text-green-600 font-bold">Ready to Launch</p>
                     </div>
                   </div>
 
-                  <div>
-                    <label className="block text-gray-900 font-bold mb-2">Schedule Date (Optional)</label>
-                    <input
-                      type="datetime-local"
-                      value={scheduledDate}
-                      onChange={(e) => setScheduledDate(e.target.value)}
-                      className="w-full px-4 py-2 border-2 border-gray-300 rounded-lg focus:outline-none focus:ring-2 focus:ring-blue-500 text-gray-900"
-                    />
-                    <p className="text-gray-600 text-sm mt-2">Leave blank to send immediately</p>
+                  {/* Send scheduling controls */}
+                  <div className="grid grid-cols-1 md:grid-cols-2 gap-4 mb-8">
+                    <div>
+                      <label className="block text-gray-900 font-bold mb-2">First Send Date/Time</label>
+                      <input
+                        type="datetime-local"
+                        value={scheduledDate}
+                        onChange={(e) => setScheduledDate(e.target.value)}
+                        className="w-full px-4 py-2 border-2 border-gray-300 rounded-lg focus:outline-none focus:ring-2 focus:ring-blue-500 text-gray-900"
+                      />
+                      <p className="text-gray-600 text-xs mt-1">Leave blank to use right now as the start time</p>
+                    </div>
+                    <div>
+                      <label className="block text-gray-900 font-bold mb-2">Minutes Between Sends</label>
+                      <input
+                        type="number"
+                        min={0}
+                        value={staggerMinutes}
+                        onChange={(e) => setStaggerMinutes(parseInt(e.target.value) || 0)}
+                        className="w-full px-4 py-2 border-2 border-gray-300 rounded-lg focus:outline-none focus:ring-2 focus:ring-blue-500 text-gray-900"
+                      />
+                      <p className="text-gray-600 text-xs mt-1">Each recipient is staggered by this many minutes</p>
+                    </div>
                   </div>
+
+                  {/* Personalized Email Previews - copy/paste-ready per recipient */}
+                  {messageTemplate && (
+                    <div className="mb-8">
+                      <h3 className="text-xl font-bold text-gray-900 mb-2">📋 Personalized Previews</h3>
+                      <p className="text-gray-600 text-sm mb-4">
+                        Copy any of these to manually send a test message, or click Launch below to save all of
+                        them to the database and download a ready-to-deploy Excel send-list.
+                      </p>
+                      <div className="space-y-4 max-h-[500px] overflow-y-auto">
+                        {buildRecipientRows().map((row) => (
+                          <div key={row.executive_id} className="border-2 border-gray-200 rounded-lg p-4 bg-white">
+                            <div className="flex justify-between items-start mb-3">
+                              <div>
+                                <p className="font-bold text-gray-900">{row.executive_name}</p>
+                                <p className="text-gray-600 text-sm">{row.title} · {row.company_name || 'N/A'}</p>
+                                <p className="text-gray-500 text-xs mt-1">
+                                  Scheduled: {new Date(row.scheduled_at).toLocaleString()}
+                                </p>
+                              </div>
+                              {row.executive_email && (
+                                <a
+                                  href={`mailto:${encodeURIComponent(row.executive_email)}?subject=${encodeURIComponent(row.subject)}&body=${encodeURIComponent(row.message_content)}`}
+                                  className="bg-blue-600 hover:bg-blue-700 text-white text-xs font-bold px-3 py-2 rounded-lg whitespace-nowrap"
+                                >
+                                  ✉️ Open in Email App
+                                </a>
+                              )}
+                            </div>
+
+                            <div className="space-y-2">
+                              <div className="flex items-center gap-2">
+                                <label className="text-xs font-bold text-gray-700 w-16">To:</label>
+                                <input
+                                  readOnly
+                                  value={row.executive_email || 'No email on file'}
+                                  className="flex-1 text-sm px-2 py-1 border rounded bg-gray-50 text-gray-900"
+                                />
+                                <button
+                                  onClick={() => copyToClipboard(row.executive_email, `${row.executive_id}-email`)}
+                                  className="text-xs bg-gray-200 hover:bg-gray-300 px-2 py-1 rounded font-bold text-gray-900"
+                                >
+                                  {copiedId === `${row.executive_id}-email` ? '✓ Copied' : 'Copy'}
+                                </button>
+                              </div>
+
+                              {row.subject && (
+                                <div className="flex items-center gap-2">
+                                  <label className="text-xs font-bold text-gray-700 w-16">Subject:</label>
+                                  <input
+                                    readOnly
+                                    value={row.subject}
+                                    className="flex-1 text-sm px-2 py-1 border rounded bg-gray-50 text-gray-900"
+                                  />
+                                  <button
+                                    onClick={() => copyToClipboard(row.subject, `${row.executive_id}-subject`)}
+                                    className="text-xs bg-gray-200 hover:bg-gray-300 px-2 py-1 rounded font-bold text-gray-900"
+                                  >
+                                    {copiedId === `${row.executive_id}-subject` ? '✓ Copied' : 'Copy'}
+                                  </button>
+                                </div>
+                              )}
+
+                              <div className="flex items-start gap-2">
+                                <label className="text-xs font-bold text-gray-700 w-16 pt-1">Body:</label>
+                                <textarea
+                                  readOnly
+                                  value={row.message_content}
+                                  rows={4}
+                                  className="flex-1 text-sm px-2 py-1 border rounded bg-gray-50 text-gray-900"
+                                />
+                                <button
+                                  onClick={() => copyToClipboard(row.message_content, `${row.executive_id}-body`)}
+                                  className="text-xs bg-gray-200 hover:bg-gray-300 px-2 py-1 rounded font-bold text-gray-900 self-start"
+                                >
+                                  {copiedId === `${row.executive_id}-body` ? '✓ Copied' : 'Copy'}
+                                </button>
+                              </div>
+                            </div>
+                          </div>
+                        ))}
+                      </div>
+                    </div>
+                  )}
                 </div>
               )}
 
@@ -448,7 +655,7 @@ export default function CampaignWizard() {
                     disabled={isSubmitting}
                     className="bg-green-600 hover:bg-green-700 disabled:bg-gray-400 text-white px-8 py-3 rounded-lg font-bold text-lg"
                   >
-                    {isSubmitting ? '⏳ Launching...' : '🚀 Launch Campaign'}
+                    {isSubmitting ? '⏳ Saving & Exporting...' : '🚀 Launch Campaign & Download Send List'}
                   </button>
                 ) : (
                   <button
