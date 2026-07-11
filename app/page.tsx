@@ -72,9 +72,9 @@ export default function WizardHome() {
               <h1 className="text-4xl font-bold text-gray-900">🚀 Outreach Wizard</h1>
               <p className="text-gray-700 mt-2">Your complete guide to B2B outreach campaigns</p>
             </div>
-            <Link href="/analytics" className="text-blue-600 hover:text-blue-800 font-bold text-lg">
+            <a href="https://outreach-analytics-puce.vercel.app" target="_blank" rel="noopener noreferrer" className="text-blue-600 hover:text-blue-800 font-bold text-lg">
               Analytics →
-            </Link>
+            </a>
           </div>
         </div>
       </header>
